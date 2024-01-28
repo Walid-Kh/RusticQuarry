@@ -1,11 +1,12 @@
-use std::fs;
-
 use rustic_qurry::crawler::{Crawler, SaveLocation};
 
 #[tokio::main]
 async fn main() {
     let mut crawler = Crawler::new(SaveLocation::File);
+    let now = std::time::Instant::now();
     crawler.start().await;
+    println!("Time elapsed: {:?}", now.elapsed());
+    println!("Done! from main.rs");
 
     // let seed = "https://www.rust-lang.org/";
     // let html = r###"

@@ -7,8 +7,9 @@ use std::{
     borrow::Borrow,
     collections::{HashSet, VecDeque},
     fs,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
+use tokio::sync::Mutex;
 use url::Url;
 
 const MAX_THREADS: usize = 8;
@@ -72,13 +73,13 @@ impl Crawler {
         base_url.to_string()
     }
 
-    fn read_seeds(&mut self) {
+    async fn read_seeds(&mut self) {
         let mut seeds: VecDeque<String> = VecDeque::new();
         read_file("seeds.txt", &mut seeds);
 
         for seed in seeds {
-            self.queue.lock().unwrap().push_back(seed.clone());
-            self.seeds.lock().unwrap().push(Page {
+            self.queue.lock().await.push_back(seed.clone());
+            self.seeds.lock().await.push(Page {
                 url: seed,
                 title: "".to_owned(),
                 description: "".to_owned(),
@@ -111,7 +112,7 @@ impl Crawler {
         }
     }
 
-    fn get_urls(html: &str, seed: &str, visited: &Arc<Mutex<HashSet<String>>>) -> HashSet<String> {
+    fn get_urls(html: &str, seed: &str, visited: HashSet<String>) -> HashSet<String> {
         let document = scraper::Html::parse_document(html);
         let anchor_selector = Selector::parse("a[href]").unwrap();
         let seed_url = Url::parse(seed).unwrap();
@@ -129,7 +130,7 @@ impl Crawler {
                 }
                 return false;
             })
-            .filter(|url| !visited.lock().unwrap().contains(url))
+            .filter(|url| !visited.contains(url))
             .collect::<HashSet<String>>()
     }
 
@@ -193,12 +194,11 @@ impl Crawler {
     }
 
     async fn save_page(
-        save_location: &Arc<Mutex<SaveLocation>>,
+        save_location: &SaveLocation,
         client: &Client,
         page: &Page,
         seed: &Page,
     ) -> Result<(), String> {
-        let save_location = *save_location.lock().unwrap();
         match save_location {
             SaveLocation::File => Crawler::save_page_to_file(page, seed),
             SaveLocation::Database => Crawler::save_page_to_database(client, page).await,
@@ -206,7 +206,7 @@ impl Crawler {
     }
 
     pub async fn start(&mut self) {
-        self.read_seeds();
+        self.read_seeds().await;
 
         let client = match Client::with_uri_str("mongodb://localhost:27017").await {
             Ok(client) => client,
@@ -216,7 +216,6 @@ impl Crawler {
             }
         };
 
-        let save_location = Arc::new(Mutex::new(self.save_location));
         let mut threads = Vec::with_capacity(MAX_THREADS);
 
         for i in 0..MAX_THREADS {
@@ -224,31 +223,39 @@ impl Crawler {
             let seeds = self.seeds.clone();
             let visited = self.visited.clone();
             let client = client.clone();
-            let save_location = save_location.clone();
+            let save_location = self.save_location.clone();
 
             let thread = tokio::spawn(async move {
                 loop {
-                    if queue.lock().unwrap().is_empty() && !visited.lock().unwrap().is_empty() {
-                        println!("Thread {} finished", i);
+                    if queue.lock().await.is_empty() && visited.lock().await.is_empty() {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        println!("Thread {} sleeping", i);
+                        continue;
+                    }
+                    if queue.lock().await.is_empty() {
                         break;
-                    } else if queue.lock().unwrap().is_empty() {
-                        continue;
                     }
+                    let link = queue.lock().await.pop_front().unwrap();
 
-                    let link = queue.lock().unwrap().pop_front().unwrap();
-                    if visited.lock().unwrap().contains(&link) {
+                    if visited.lock().await.contains(&link) {
                         continue;
                     }
+                    println!("Thread {} working on {}", i, link);
 
                     let html = match Crawler::get_html(&link).await {
                         Ok(html) => html,
-                        Err(_) => continue,
+                        Err(err) => {
+                            println!("Error getting html: {} {}", link, err);
+                            continue;
+                        }
                     };
                     let page = Crawler::get_page(&html, &link);
 
                     let seed = {
                         let mut res: Option<Page> = None;
-                        for seed in seeds.lock().unwrap().iter() {
+                        let seeds = seeds.lock().await;
+
+                        for seed in seeds.iter() {
                             if link.starts_with(&seed.url) {
                                 res = Some(seed.clone());
                                 break;
@@ -260,7 +267,7 @@ impl Crawler {
                         }
                     };
 
-                    if !visited.lock().unwrap().contains(&link) {
+                    if !visited.lock().await.contains(&link) {
                         match Crawler::save_page(&save_location, &client, &page, &seed).await {
                             Ok(_) => {}
                             Err(err) => {
@@ -269,14 +276,14 @@ impl Crawler {
                             }
                         };
                     }
-                    visited.lock().unwrap().insert(link.clone());
+                    visited.lock().await.insert(link.clone());
 
-                    let urls = Crawler::get_urls(&html, &seed.url, &visited);
-                    queue.lock().unwrap().extend(urls.to_owned());
+                    let urls = Crawler::get_urls(&html, &seed.url, visited.lock().await.clone());
+                    queue.lock().await.extend(urls.to_owned());
 
                     println!("{i}:{}", link);
 
-                    if queue.lock().unwrap().is_empty() {
+                    if queue.lock().await.is_empty() {
                         println!("Thread {} finished", i);
                         break;
                     }
